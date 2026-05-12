@@ -36,7 +36,7 @@ GitHub Actions workflow: `.github/workflows/release.yml`
 - Release assets include binaries for:
   - Windows (`windows-amd64`)
   - Linux (`linux-amd64`)
-  - macOS (`macos-amd64`, `macos-arm64`)
+  - macOS (`macos-arm64`)
 
 ## API
 

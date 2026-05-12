@@ -35,11 +35,6 @@ jobs:
             goos: linux
             goarch: amd64
             target: linux-amd64
-          - label: macos-amd64
-            runner: macos-13
-            goos: darwin
-            goarch: amd64
-            target: macos-amd64
           - label: macos-arm64
             runner: macos-latest
             goos: darwin

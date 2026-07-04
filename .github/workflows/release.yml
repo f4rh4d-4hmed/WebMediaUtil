@@ -64,7 +64,11 @@ jobs:
             out="${out}.exe"
           fi
 
+          VERSION="${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}"
           LDFLAGS="-s -w"
+          if [ -n "${VERSION}" ]; then
+            LDFLAGS="${LDFLAGS} -X main.Version=${VERSION}"
+          fi
           if [ "${{ matrix.goos }}" = "windows" ]; then
             LDFLAGS="${LDFLAGS} -H=windowsgui"
           fi

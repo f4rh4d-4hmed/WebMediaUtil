@@ -16,25 +16,38 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-func parseConfig() Config {
+// Version is the current version of shadoware, set at build time.
+var Version = "dev"
+
+func parseConfig() (Config, bool) {
 	var cfg Config
+	var showVersion bool
 	flag.StringVar(&cfg.Port, "port", ":8080", "HTTP listen address")
 	flag.BoolVar(&cfg.Headless, "headless", false, "Run browser headless")
 	flag.IntVar(&cfg.MaxTabs, "max-tabs", 5, "Max concurrent browser tabs")
 	flag.StringVar(&cfg.Browser, "browser", "", "Override browser executable path")
 	flag.DurationVar(&cfg.Timeout, "timeout", 120*time.Second, "Per-request timeout")
 	flag.StringVar(&cfg.Mode, "mode", "extension", "Default scrape mode: extension | cdp")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		return cfg, true
+	}
 
 	if !strings.HasPrefix(cfg.Port, ":") && !strings.Contains(cfg.Port, ":") {
 		cfg.Port = ":" + cfg.Port
 	}
 	cfg.Mode = strings.ToLower(cfg.Mode)
-	return cfg
+	return cfg, false
 }
 
 func main() {
-	cfg := parseConfig()
+	cfg, showVersion := parseConfig()
+	if showVersion {
+		fmt.Printf("shadoware %s\n", Version)
+		return
+	}
 
 	browserPath := cfg.Browser
 	var browserName string

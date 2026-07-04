@@ -28,7 +28,8 @@ go run .
 | `-browser` | _(auto)_ | Path to custom browser executable |
 | `-timeout` | `120s` | Per-request timeout limit |
 | `-mode` | `extension`| Default scraping mode (`extension` or `cdp`) |
-| `-version` | `version`| Check version of app thats installed |
+| `-version` | | Print version and exit |
+| `-disable-watchdog`| `false` | Disable parent process watchdog (prevents auto-shutdown if parent process exits) |
 
 ---
 
@@ -159,6 +160,6 @@ Use these action objects in `actions` arrays to interact with pages:
 
 ## Technical Features
 - **Anti-Bot Stealth**: Injected scripts disguise automation by removing `navigator.webdriver` and patching browser properties.
-- **Parent Watchdog**: The service monitors the parent process's PID and automatically shuts down if the parent exits.
+- **Parent Watchdog**: The service monitors the parent process's PID and automatically shuts down if the parent exits (can be disabled via `-disable-watchdog`).
 - **CORS Enabled**: All endpoints allow cross-origin requests (`Access-Control-Allow-Origin: *`).
 - **Response Body Scanning**: Inspects responses for JSON, JS, and HTML, extracting matching URLs hidden inside scripts or API responses.

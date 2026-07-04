@@ -29,6 +29,7 @@ func parseConfig() (Config, bool) {
 	flag.DurationVar(&cfg.Timeout, "timeout", 120*time.Second, "Per-request timeout")
 	flag.StringVar(&cfg.Mode, "mode", "extension", "Default scrape mode: extension | cdp")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.BoolVar(&cfg.DisableWatchdog, "disable-watchdog", false, "Disable parent process watchdog")
 	flag.Parse()
 
 	if showVersion {
@@ -128,7 +129,11 @@ func main() {
 		shutdown(fmt.Sprintf("signal %s received", sig))
 	}()
 
-	startParentWatchdog(shutdown)
+	if !cfg.DisableWatchdog {
+		startParentWatchdog(shutdown)
+	} else {
+		log.Println("Parent watchdog disabled")
+	}
 
 	fmt.Printf("Shadoware active on http://localhost%s  (parent PID: %d)\n", cfg.Port, os.Getppid())
 	fmt.Printf("Mode: %s | Headless: %v | MaxTabs: %d | Timeout: %s\n",

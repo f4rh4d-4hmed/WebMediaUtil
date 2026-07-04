@@ -11,12 +11,13 @@ const (
 )
 
 type Config struct {
-	Port     string
-	Headless bool
-	MaxTabs  int
-	Browser  string
-	Timeout  time.Duration
-	Mode     string
+	Port            string
+	Headless        bool
+	MaxTabs         int
+	Browser         string
+	Timeout         time.Duration
+	Mode            string
+	DisableWatchdog bool
 }
 
 type TaskRequest struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,7 @@ type extensionJobResult struct {
 type extensionJobHub struct {
 	mu      sync.Mutex
 	queue   []*extensionJob
+	head    int // index of the next job to dequeue; avoids O(n) slice shift
 	results map[string]chan extensionJobResult
 }
 
@@ -85,11 +87,19 @@ func (h *extensionJobHub) enqueue(job *extensionJob) <-chan extensionJobResult {
 func (h *extensionJobHub) next() (*extensionJob, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(h.queue) == 0 {
+	if h.head >= len(h.queue) {
+		// Queue is empty — reset to free memory
+		h.queue = h.queue[:0]
+		h.head = 0
 		return nil, false
 	}
-	job := h.queue[0]
-	h.queue = h.queue[1:]
+	job := h.queue[h.head]
+	h.head++
+	// Compact once half the slice is consumed dead slots
+	if h.head > 64 && h.head > len(h.queue)/2 {
+		h.queue = append(h.queue[:0], h.queue[h.head:]...)
+		h.head = 0
+	}
 	return job, true
 }
 
@@ -109,9 +119,10 @@ func (h *extensionJobHub) cancel(jobID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.results, jobID)
-	for i, job := range h.queue {
-		if job.JobID == jobID {
+	for i := h.head; i < len(h.queue); i++ {
+		if h.queue[i].JobID == jobID {
 			h.queue = append(h.queue[:i], h.queue[i+1:]...)
+			// Removing from the middle does not affect head since i >= h.head
 			break
 		}
 	}
@@ -306,7 +317,9 @@ const contentScript = `(function() {
 })();`
 
 func ensureCaptureExtension(serverAddr string) (string, error) {
-	dir := filepath.Join(os.TempDir(), "webmediautil-capture-extension")
+	// Use the port in the dir name so concurrent server instances don't collide
+	portPart := strings.TrimPrefix(serverAddr, ":")
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("webmediautil-ext-%s", portPart))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}

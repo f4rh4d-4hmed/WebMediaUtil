@@ -19,11 +19,11 @@ import (
 // Version of WebMediaUtil. Can be overridden at build time.
 var Version = "dev"
 
-func parseConfig() (Config, bool) {
+func parseConfig() Config {
 	var cfg Config
 	flag.StringVar(&cfg.Port, "port", ":8080", "HTTP listen address")
-	flag.BoolVar(&cfg.Headless, "headless", true, "Run browser headless (always true for this repo)")
-	flag.IntVar(&cfg.MaxTabs, "max-tabs", 5, "Max concurrent browser tabs")
+	flag.BoolVar(&cfg.Headless, "headless", true, "Run browser headless")
+	flag.IntVar(&cfg.MaxTabs, "max-tabs", 5, "Max concurrent browser tabs (1–50)")
 	flag.StringVar(&cfg.Browser, "browser", "", "Override browser executable path")
 	flag.DurationVar(&cfg.Timeout, "timeout", 120*time.Second, "Per-request timeout")
 	flag.BoolVar(&cfg.DisableWatchdog, "disable-watchdog", false, "Disable parent process watchdog")
@@ -32,7 +32,10 @@ func parseConfig() (Config, bool) {
 	if !strings.HasPrefix(cfg.Port, ":") && !strings.Contains(cfg.Port, ":") {
 		cfg.Port = ":" + cfg.Port
 	}
-	return cfg, false
+	if cfg.MaxTabs < 1 || cfg.MaxTabs > 50 {
+		log.Fatalf("max-tabs must be between 1 and 50, got %d", cfg.MaxTabs)
+	}
+	return cfg
 }
 
 func listenWithRetry(requestedPort string) (net.Listener, string, error) {
@@ -60,7 +63,7 @@ func listenWithRetry(requestedPort string) (net.Listener, string, error) {
 }
 
 func main() {
-	cfg, _ := parseConfig()
+	cfg := parseConfig()
 
 	// 1. Resolve browser executable path
 	browserPath := cfg.Browser
@@ -95,7 +98,7 @@ func main() {
 	log.Printf("Capture extension ready at %s", captureExtensionDir)
 
 	// 4. Start persistent browser daemon
-	bd := NewBrowserDaemon(browserPath, browserName, captureExtensionDir)
+	bd := NewBrowserDaemon(browserPath, browserName, captureExtensionDir, cfg.Headless)
 	bd.Start()
 
 	captureHub := newExtensionCaptureHub()

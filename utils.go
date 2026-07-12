@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -174,7 +172,7 @@ func isM3U8URL(raw string) bool {
 
 func dedupe(in []string) []string {
 	seen := make(map[string]struct{}, len(in))
-	out := in[:0]
+	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if _, ok := seen[s]; !ok {
 			seen[s] = struct{}{}
@@ -255,27 +253,7 @@ func validateBrowserAction(a BrowserAction) error {
 	return nil
 }
 
-func newID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
 
-func safeFilePart(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() == 0 {
-		return "job"
-	}
-	if b.Len() > 16 {
-		return b.String()[:16]
-	}
-	return b.String()
-}
 
 func validateAndParseHLS(ctx context.Context, manifestURL string, headers map[string]string) ([]HLSQuality, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -327,12 +305,17 @@ func validateAndParseHLS(ctx context.Context, manifestURL string, headers map[st
 			currentInfo = line
 		} else if !strings.HasPrefix(line, "#") {
 			if currentInfo != "" {
-				resolution := "unknown"
-				if match := resolutionRegex.FindStringSubmatch(currentInfo); len(match) > 1 {
-					resolution = match[1]
-				} else if match := bandwidthRegex.FindStringSubmatch(currentInfo); len(match) > 1 {
-					bandwidth, _ := strconv.Atoi(match[1])
-					resolution = fmt.Sprintf("%d Kbps", bandwidth/1000)
+				quality := "unknown"
+				if resMatch := resolutionRegex.FindStringSubmatch(currentInfo); len(resMatch) > 1 {
+					quality = resMatch[1]
+					// Append bandwidth when both are present
+					if bwMatch := bandwidthRegex.FindStringSubmatch(currentInfo); len(bwMatch) > 1 {
+						bandwidth, _ := strconv.Atoi(bwMatch[1])
+						quality = fmt.Sprintf("%s @ %d Kbps", quality, bandwidth/1000)
+					}
+				} else if bwMatch := bandwidthRegex.FindStringSubmatch(currentInfo); len(bwMatch) > 1 {
+					bandwidth, _ := strconv.Atoi(bwMatch[1])
+					quality = fmt.Sprintf("%d Kbps", bandwidth/1000)
 				}
 
 				streamURL := line
@@ -343,7 +326,7 @@ func validateAndParseHLS(ctx context.Context, manifestURL string, headers map[st
 				}
 
 				qualities = append(qualities, HLSQuality{
-					Quality: resolution,
+					Quality: quality,
 					URL:     streamURL,
 					Headers: headers,
 				})

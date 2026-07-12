@@ -49,7 +49,7 @@ func TestEndpoints(t *testing.T) {
 	defer os.RemoveAll(captureDir)
 
 	// 4. Start browser daemon
-	bd := NewBrowserDaemon(browserPath, browserName, captureDir)
+	bd := NewBrowserDaemon(browserPath, browserName, captureDir, true)
 	bd.Start()
 	defer bd.Stop()
 

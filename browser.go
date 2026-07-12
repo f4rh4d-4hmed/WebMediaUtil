@@ -16,6 +16,7 @@ type BrowserDaemon struct {
 	browserPath  string
 	browserName  string
 	extensionDir string
+	headless     bool
 	process      *exec.Cmd
 	profileDir   string
 	startedAt    time.Time
@@ -24,11 +25,12 @@ type BrowserDaemon struct {
 	running      bool
 }
 
-func NewBrowserDaemon(browserPath, browserName, extensionDir string) *BrowserDaemon {
+func NewBrowserDaemon(browserPath, browserName, extensionDir string, headless bool) *BrowserDaemon {
 	return &BrowserDaemon{
 		browserPath:  browserPath,
 		browserName:  browserName,
 		extensionDir: extensionDir,
+		headless:     headless,
 	}
 }
 
@@ -64,7 +66,7 @@ func (bd *BrowserDaemon) monitorLoop() {
 
 		bd.mu.Lock()
 		bd.profileDir = profileDir
-		args := buildBrowserArgs(bd.extensionDir, profileDir)
+		args := buildBrowserArgs(bd.extensionDir, profileDir, bd.headless)
 		cmd := exec.Command(bd.browserPath, args...)
 		bd.process = cmd
 		bd.mu.Unlock()
@@ -167,10 +169,9 @@ func (bd *BrowserDaemon) Status() map[string]interface{} {
 	}
 }
 
-func buildBrowserArgs(extensionDir, profileDir string) []string {
-	return []string{
+func buildBrowserArgs(extensionDir, profileDir string, headless bool) []string {
+	args := []string{
 		"--user-data-dir=" + profileDir,
-		"--headless=new",
 		"--no-sandbox",
 		"--disable-gpu",
 		"--disable-dev-shm-usage",
@@ -202,6 +203,10 @@ func buildBrowserArgs(extensionDir, profileDir string) []string {
 		"--disable-logging",
 		"about:blank",
 	}
+	if headless {
+		args = append([]string{"--headless=new"}, args...)
+	}
+	return args
 }
 
 func findBrowser() (path, name string) {

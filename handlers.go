@@ -94,11 +94,12 @@ func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	events := make(chan StreamEvent, 256)
+	events := make(chan StreamEvent, 2048)
 	emit := func(ev StreamEvent) {
 		select {
 		case events <- ev:
 		default:
+			log.Println("[stream] event buffer full, dropping event for URL:", ev.URL)
 		}
 	}
 	results := make(chan scrapeResult, 1)

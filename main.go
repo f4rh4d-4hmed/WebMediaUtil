@@ -6,50 +6,63 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
-	"golang.org/x/sync/semaphore"
 )
 
-// Version is the current version of shadoware, set at build time.
+// Version of WebMediaUtil. Can be overridden at build time.
 var Version = "dev"
 
 func parseConfig() (Config, bool) {
 	var cfg Config
-	var showVersion bool
 	flag.StringVar(&cfg.Port, "port", ":8080", "HTTP listen address")
-	flag.BoolVar(&cfg.Headless, "headless", false, "Run browser headless")
+	flag.BoolVar(&cfg.Headless, "headless", true, "Run browser headless (always true for this repo)")
 	flag.IntVar(&cfg.MaxTabs, "max-tabs", 5, "Max concurrent browser tabs")
 	flag.StringVar(&cfg.Browser, "browser", "", "Override browser executable path")
 	flag.DurationVar(&cfg.Timeout, "timeout", 120*time.Second, "Per-request timeout")
-	flag.StringVar(&cfg.Mode, "mode", "extension", "Default scrape mode: extension | cdp")
-	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.BoolVar(&cfg.DisableWatchdog, "disable-watchdog", false, "Disable parent process watchdog")
 	flag.Parse()
-
-	if showVersion {
-		return cfg, true
-	}
 
 	if !strings.HasPrefix(cfg.Port, ":") && !strings.Contains(cfg.Port, ":") {
 		cfg.Port = ":" + cfg.Port
 	}
-	cfg.Mode = strings.ToLower(cfg.Mode)
 	return cfg, false
 }
 
-func main() {
-	cfg, showVersion := parseConfig()
-	if showVersion {
-		fmt.Printf("shadoware %s\n", Version)
-		return
+func listenWithRetry(requestedPort string) (net.Listener, string, error) {
+	portStr := requestedPort
+	if strings.HasPrefix(portStr, ":") {
+		portStr = portStr[1:]
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 8080
 	}
 
+	for {
+		addr := fmt.Sprintf(":%d", port)
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, fmt.Sprintf(":%d", port), nil
+		}
+		log.Printf("Port %d is already in use, trying %d...", port, port+1)
+		port++
+		if port > 65535 {
+			return nil, "", errors.New("no available ports in range")
+		}
+	}
+}
+
+func main() {
+	cfg, _ := parseConfig()
+
+	// 1. Resolve browser executable path
 	browserPath := cfg.Browser
 	var browserName string
 	if browserPath == "" {
@@ -62,51 +75,46 @@ func main() {
 	}
 	log.Printf("Using browser: %s (%s)", browserName, browserPath)
 
+	// 2. Bind port with collision auto-increment
+	ln, boundPort, err := listenWithRetry(cfg.Port)
+	if err != nil {
+		log.Fatalf("Failed to bind to any port: %v", err)
+	}
+	cfg.Port = boundPort
+
+	// Output to stdout to let the parent process know the bound port
+	fmt.Printf("PORT_BOUND: %s\n", boundPort)
+	os.Stdout.Sync()
+
+	// 3. Prepare capture extension files with the actual bound port
 	captureExtensionDir, err := ensureCaptureExtension(cfg.Port)
 	if err != nil {
+		_ = ln.Close()
 		log.Fatalf("Failed to prepare capture extension: %v", err)
 	}
 	log.Printf("Capture extension ready at %s", captureExtensionDir)
 
-	opts := buildAllocatorOptions(browserPath, captureExtensionDir, cfg)
-	bm := newBrowserManager(browserPath, browserName, opts)
+	// 4. Start persistent browser daemon
+	bd := NewBrowserDaemon(browserPath, browserName, captureExtensionDir)
+	bd.Start()
 
 	captureHub := newExtensionCaptureHub()
 	jobHub := newExtensionJobHub()
-	pool := newTabPool(bm)
-	bm.pool = pool
-
-	sem := semaphore.NewWeighted(int64(cfg.MaxTabs))
+	sem := NewSemaphore(cfg.MaxTabs)
 
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("POST /execute", handleExecute(bm, sem, cfg, captureHub, jobHub, browserPath, captureExtensionDir))
-	mux.HandleFunc("POST /scrape/hls", handleScrapeHLS(bm, sem, cfg, captureHub, jobHub, browserPath, captureExtensionDir))
-
-	mux.HandleFunc("GET /tabs", handleTabList(pool))
-	mux.HandleFunc("POST /tabs", handleTabCreate(pool))
-	mux.HandleFunc("GET /tabs/{id}", handleTabGet(pool))
-	mux.HandleFunc("DELETE /tabs/{id}", handleTabClose(pool))
-	mux.HandleFunc("POST /tabs/{id}/navigate", handleTabNavigate(pool))
-	mux.HandleFunc("POST /tabs/{id}/actions", handleTabActions(pool))
-	mux.HandleFunc("GET /tabs/{id}/snapshot", handleTabSnapshot(pool))
-	mux.HandleFunc("POST /tabs/{id}/evaluate", handleTabEvaluate(pool))
-	mux.HandleFunc("DELETE /tabs/{id}/urls", handleTabClearURLs(pool))
-
-	mux.HandleFunc("GET /browser", handleBrowserStatus(bm))
-	mux.HandleFunc("POST /browser/restart", handleBrowserRestart(bm))
-
-	mux.HandleFunc("GET /config", handleConfigGet(cfg, browserPath, browserName))
+	mux.HandleFunc("POST /execute", handleExecute(bd, sem, cfg, captureHub, jobHub))
+	mux.HandleFunc("POST /scrape/hls", handleScrapeHLS(bd, sem, cfg, captureHub, jobHub))
+	mux.HandleFunc("GET /health", handleHealth)
+	mux.HandleFunc("GET /config", handleConfigGet(cfg, bd))
+	mux.HandleFunc("GET /version", handleVersion)
 
 	mux.HandleFunc("GET /extension-command", handleExtensionCommand(jobHub))
 	mux.HandleFunc("POST /extension-capture", handleExtensionCapture(captureHub))
 	mux.HandleFunc("POST /extension-result", handleExtensionResult(jobHub))
 
-	mux.HandleFunc("GET /health", handleHealth)
-
 	timeout := cfg.Timeout
 	srv := &http.Server{
-		Addr:         cfg.Port,
 		Handler:      withCORS(withLogging(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: timeout + 5*time.Second,
@@ -115,6 +123,11 @@ func main() {
 
 	shutdown := func(reason string) {
 		log.Printf("Shutting down: %s", reason)
+		// Stop the browser and clean up profile dir
+		bd.Stop()
+		// Clean up the temp extension files
+		_ = os.RemoveAll(captureExtensionDir)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
@@ -122,6 +135,7 @@ func main() {
 		}
 	}
 
+	// Listen for system termination signals
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -129,16 +143,17 @@ func main() {
 		shutdown(fmt.Sprintf("signal %s received", sig))
 	}()
 
+	// Start parent process watchdog if not disabled
 	if !cfg.DisableWatchdog {
 		startParentWatchdog(shutdown)
 	} else {
 		log.Println("Parent watchdog disabled")
 	}
 
-	fmt.Printf("Shadoware active on http://localhost%s  (parent PID: %d)\n", cfg.Port, os.Getppid())
-	fmt.Printf("Mode: %s | Headless: %v | MaxTabs: %d | Timeout: %s\n",
-		cfg.Mode, cfg.Headless, cfg.MaxTabs, cfg.Timeout)
-	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+	log.Printf("WebMediaUtil active on http://localhost%s  (parent PID: %d)", cfg.Port, os.Getppid())
+	log.Printf("Headless: true | MaxTabs: %d | Timeout: %s", cfg.MaxTabs, cfg.Timeout)
+
+	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Server error: %v", err)
 	}
 }

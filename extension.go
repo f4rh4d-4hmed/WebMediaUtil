@@ -5,11 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,13 +14,14 @@ import (
 var nextExtensionJobID atomic.Uint64
 
 type extensionCaptureEvent struct {
-	JobID     string `json:"job_id,omitempty"`
-	URL       string `json:"url"`
-	TabID     int    `json:"tab_id"`
-	FrameID   int    `json:"frame_id"`
-	RequestID string `json:"request_id"`
-	Type      string `json:"type"`
-	Initiator string `json:"initiator,omitempty"`
+	JobID          string            `json:"job_id,omitempty"`
+	URL            string            `json:"url"`
+	TabID          int               `json:"tab_id"`
+	FrameID        int               `json:"frame_id"`
+	RequestID      string            `json:"request_id"`
+	Type           string            `json:"type"`
+	Initiator      string            `json:"initiator,omitempty"`
+	RequestHeaders map[string]string `json:"request_headers,omitempty"`
 }
 
 type extensionCaptureSession struct {
@@ -168,11 +165,6 @@ func (h *extensionCaptureHub) capture(ev extensionCaptureEvent) {
 	}
 }
 
-type extensionBrowserProcess struct {
-	cmd        *exec.Cmd
-	profileDir string
-}
-
 const contentScript = `(function() {
   // 1. Popup Blocker (Always active)
   try {
@@ -314,14 +306,14 @@ const contentScript = `(function() {
 })();`
 
 func ensureCaptureExtension(serverAddr string) (string, error) {
-	dir := filepath.Join(os.TempDir(), "shadoware-capture-extension")
+	dir := filepath.Join(os.TempDir(), "webmediautil-capture-extension")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
 	apiBase := "http://127.0.0.1" + serverAddr
 	manifest := `{
   "manifest_version": 3,
-  "name": "ShadoWare Capture",
+  "name": "WebMediaUtil Capture",
   "version": "1.0.0",
   "permissions": ["webRequest", "declarativeNetRequest", "tabs", "scripting"],
   "host_permissions": ["<all_urls>"],
@@ -340,33 +332,14 @@ func ensureCaptureExtension(serverAddr string) (string, error) {
 const CAPTURE = API_BASE + "/extension-capture";
 const COMMAND = API_BASE + "/extension-command";
 const RESULT  = API_BASE + "/extension-result";
-const tabJobs = new Map();
+
+const jobs = new Map();
+const jobByJobId = new Map();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function post(url, body) {
   await fetch(url, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
 }
-
-// FIX #4: capture request headers for media URLs
-const pendingHeaders = new Map(); // requestId -> headers
-
-chrome.webRequest.onBeforeSendHeaders.addListener((d) => {
-  if (!d.url || d.url.startsWith(API_BASE)) return;
-  const lower = d.url.toLowerCase();
-  const isMedia = lower.includes('.m3u8') || lower.includes('playlist') ||
-                  lower.includes('manifest') || lower.includes('.mpd') ||
-                  lower.includes('.mp4');
-  if (!isMedia) return;
-  const hdrs = {};
-  (d.requestHeaders || []).forEach(h => { hdrs[h.name] = h.value; });
-  pendingHeaders.set(d.requestId, hdrs);
-}, { urls: ["<all_urls>"] }, ["requestHeaders", "extraHeaders"]);
-
-let currentJob = null;
-let mainTabId = null;
-const capturedUrls = [];
-const capturedMedia = [];
-const capturedHeaders = [];
 
 function isMediaURL(url) {
   const lower = url.toLowerCase();
@@ -375,28 +348,43 @@ function isMediaURL(url) {
          lower.includes('.mp4');
 }
 
+const pendingHeaders = new Map();
+
+chrome.webRequest.onBeforeSendHeaders.addListener((d) => {
+  if (!d.url || d.url.startsWith(API_BASE)) return;
+  const context = jobs.get(d.tabId);
+  if (!context) return;
+
+  const isMedia = isMediaURL(d.url);
+  if (!isMedia) return;
+
+  const hdrs = {};
+  (d.requestHeaders || []).forEach(h => { hdrs[h.name] = h.value; });
+  pendingHeaders.set(d.requestId, hdrs);
+}, { urls: ["<all_urls>"] }, ["requestHeaders", "extraHeaders"]);
+
 chrome.webRequest.onSendHeaders.addListener((d) => {
   if (!d.url || d.url.startsWith(API_BASE)) return;
-  const jobId = tabJobs.get(d.tabId);
-  if (!jobId || !currentJob) return;
+  const context = jobs.get(d.tabId);
+  if (!context) return;
 
   const isMedia = isMediaURL(d.url);
   const reqHeaders = pendingHeaders.get(d.requestId) || {};
 
   if (isMedia) {
-    capturedMedia.push(d.url);
-    capturedHeaders.push({
+    context.capturedMedia.push(d.url);
+    context.capturedHeaders.push({
       url: d.url,
       status: 200,
       request_headers: reqHeaders
     });
   }
-  if (currentJob.debug) {
-    capturedUrls.push(d.url);
+  if (context.debug) {
+    context.capturedUrls.push(d.url);
   }
 
-  if (currentJob.stream) {
-    post(CAPTURE, { job_id: jobId, url: d.url, tab_id: d.tabId, frame_id: d.frameId,
+  if (context.stream) {
+    post(CAPTURE, { job_id: context.jobId, url: d.url, tab_id: d.tabId, frame_id: d.frameId,
                     request_id: d.requestId, type: d.type, initiator: d.initiator||"",
                     request_headers: reqHeaders }).catch(()=>{});
   }
@@ -405,20 +393,28 @@ chrome.webRequest.onSendHeaders.addListener((d) => {
 chrome.webRequest.onCompleted.addListener((d) => {
   pendingHeaders.delete(d.requestId);
 }, { urls: ["<all_urls>"] });
+
 chrome.webRequest.onErrorOccurred.addListener((d) => {
   pendingHeaders.delete(d.requestId);
 }, { urls: ["<all_urls>"] });
 
 chrome.tabs.onCreated.addListener((tab) => {
-  if (currentJob && mainTabId && tab.id !== mainTabId) {
-    console.log("Popup blocked:", tab.id);
+  if (tab.openerTabId && jobs.has(tab.openerTabId)) {
+    console.log("Popup blocked:", tab.id, "opener:", tab.openerTabId);
     chrome.tabs.remove(tab.id).catch(() => {});
   }
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_SCRAPER_STATE") {
-    sendResponse({ active: currentJob && currentJob.is_hls_scrape });
+    if (sender.tab && sender.tab.id !== undefined) {
+      const context = jobs.get(sender.tab.id);
+      if (context) {
+        sendResponse({ active: !!context.isHLSScrape });
+        return true;
+      }
+    }
+    sendResponse({ active: false });
   }
   return true;
 });
@@ -467,18 +463,28 @@ async function runAction(tabId, a) {
 }
 
 async function runJob(job) {
-  currentJob = job;
-  mainTabId = null;
-  capturedUrls.length = 0;
-  capturedMedia.length = 0;
-  capturedHeaders.length = 0;
+  const jobId = job.job_id;
+  const timeoutMs = (job.wait_ms || 0) + 35000;
   let tab;
+  let timer;
   try {
-    tab = await chrome.tabs.create({ url: "about:blank", active: true });
-    mainTabId = tab.id;
-    tabJobs.set(tab.id, job.job_id);
+    tab = await chrome.tabs.create({ url: "about:blank", active: false });
+    const tabId = tab.id;
+    const context = {
+      jobId: jobId,
+      tabId: tabId,
+      url: job.url,
+      debug: job.debug,
+      stream: job.stream,
+      isHLSScrape: job.is_hls_scrape,
+      capturedUrls: [],
+      capturedMedia: [],
+      capturedHeaders: [],
+      pendingHeaders: new Map()
+    };
+    jobs.set(tabId, context);
+    jobByJobId.set(jobId, context);
 
-    // Apply declarative rules for custom headers
     if (job.headers && Object.keys(job.headers).length > 0) {
       const requestHeaders = [];
       for (const [k, v] of Object.entries(job.headers)) {
@@ -489,50 +495,59 @@ async function runJob(job) {
         });
       }
       await chrome.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [1],
+        removeRuleIds: [tabId],
         addRules: [
           {
-            id: 1,
+            id: tabId,
             priority: 1,
             action: {
               type: "modifyHeaders",
               requestHeaders: requestHeaders
             },
             condition: {
-              tabIds: [tab.id],
-              resourceTypes: ["main_frame", "sub_frame"]
+              tabIds: [tabId]
             }
           }
         ]
       });
     }
 
-    await chrome.tabs.update(tab.id, { url: job.url });
-    await waitComplete(tab.id);
-    if (job.local_storage && Object.keys(job.local_storage).length) {
-      await chrome.scripting.executeScript({ target:{tabId:tab.id}, args:[job.local_storage],
-        func:(items)=>{ for(const[k,v] of Object.entries(items)) localStorage.setItem(k,v); } });
-      await chrome.tabs.reload(tab.id);
-      await waitComplete(tab.id);
-    }
-    for (const action of job.actions||[]) await runAction(tab.id, action);
-    if (job.wait_ms) await sleep(job.wait_ms);
-    const frames = await chrome.scripting.executeScript({ target:{tabId:tab.id,allFrames:true},
-      func:()=>document.documentElement.outerHTML });
-    const content = frames.map(f=>f.result||"").join("\n");
-    await post(RESULT, { job_id: job.job_id, content: content, m3u8_urls: capturedMedia, all_urls: capturedUrls, captures: capturedHeaders });
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Job execution timed out in browser extension")), timeoutMs);
+    });
+
+    const workPromise = (async () => {
+      await chrome.tabs.update(tabId, { url: job.url });
+      await waitComplete(tabId);
+      if (job.local_storage && Object.keys(job.local_storage).length) {
+        await chrome.scripting.executeScript({ target:{tabId:tabId}, args:[job.local_storage],
+          func:(items)=>{ for(const[k,v] of Object.entries(items)) localStorage.setItem(k,v); } });
+        await chrome.tabs.reload(tabId);
+        await waitComplete(tabId);
+      }
+      for (const action of job.actions||[]) await runAction(tabId, action);
+      if (job.wait_ms) await sleep(job.wait_ms);
+      const frames = await chrome.scripting.executeScript({ target:{tabId:tabId,allFrames:true},
+        func:()=>document.documentElement.outerHTML });
+      return frames.map(f=>f.result||"").join("\n");
+    })();
+
+    const content = await Promise.race([workPromise, timeoutPromise]);
+    await post(RESULT, { job_id: jobId, content: content, m3u8_urls: context.capturedMedia, all_urls: context.capturedUrls, captures: context.capturedHeaders });
   } catch(e) {
-    await post(RESULT, { job_id: job.job_id, content: "", error: e&&e.message?e.message:String(e), m3u8_urls: capturedMedia, all_urls: capturedUrls, captures: capturedHeaders }).catch(()=>{});
+    const context = jobByJobId.get(jobId) || { capturedMedia: [], capturedUrls: [], capturedHeaders: [] };
+    await post(RESULT, { job_id: jobId, content: "", error: e&&e.message?e.message:String(e), m3u8_urls: context.capturedMedia, all_urls: context.capturedUrls, captures: context.capturedHeaders }).catch(()=>{});
   } finally {
-    currentJob = null;
-    mainTabId = null;
-    if (tab&&tab.id!==undefined) {
-      tabJobs.delete(tab.id);
-      if (job.close_tab!==false) chrome.tabs.remove(tab.id).catch(()=>{});
+    if (timer) clearTimeout(timer);
+    if (tab && tab.id !== undefined) {
+      const tabId = tab.id;
+      jobs.delete(tabId);
+      jobByJobId.delete(jobId);
+      chrome.tabs.remove(tabId).catch(()=>{});
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [tabId]
+      }).catch(()=>{});
     }
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [1]
-    }).catch(()=>{});
   }
 }
 
@@ -540,8 +555,12 @@ async function poll() {
   for(;;) {
     try {
       const r = await fetch(COMMAND);
-      if (r.status===200) await runJob(await r.json());
-      else await sleep(500);
+      if (r.status===200) {
+        const job = await r.json();
+        runJob(job).catch(err => console.error("Job error:", err));
+      } else {
+        await sleep(250);
+      }
     } catch(_) { await sleep(1000); }
   }
 }
@@ -560,77 +579,7 @@ poll();
 	return dir, nil
 }
 
-func launchExtensionBrowser(browserPath, extensionDir, jobID, userAgent string) (*extensionBrowserProcess, error) {
-	profileDir, err := os.MkdirTemp("", "shadoware-profile-"+safeFilePart(jobID)+"-")
-	if err != nil {
-		return nil, err
-	}
-	args := []string{
-		"--user-data-dir=" + profileDir,
-		"--headless=new",
-		"--no-sandbox",
-		"--disable-gpu",
-		"--disable-dev-shm-usage",
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-blink-features=AutomationControlled",
-		"--disable-extensions-except=" + extensionDir,
-		"--load-extension=" + extensionDir,
-		"--window-size=1365,768",
-		"--mute-audio",
-		"--autoplay-policy=no-user-gesture-required",
-		"--enable-features=MediaSourceAPI,MSE",
-		"--disable-background-networking",
-		"--disable-background-timer-throttling",
-		"--disable-backgrounding-occluded-windows",
-		"--disable-breakpad",
-		"--disable-client-side-phishing-detection",
-		"--disable-default-apps",
-		"--disable-hang-monitor",
-		"--disable-ipc-flooding-protection",
-		"--disable-prompt-on-repost",
-		"--disable-renderer-backgrounding",
-		"--disable-sync",
-		"--metrics-recording-only",
-		"--safebrowsing-disable-auto-update",
-		"--password-store=basic",
-		"--use-mock-keychain",
-		"about:blank",
-	}
-	if userAgent != "" {
-		args = append(args, "--user-agent="+userAgent)
-	}
-	cmd := exec.Command(browserPath, args...)
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(profileDir)
-		return nil, err
-	}
-	return &extensionBrowserProcess{cmd: cmd, profileDir: profileDir}, nil
-}
-
-func closeExtensionBrowser(b *extensionBrowserProcess) {
-	if b == nil {
-		return
-	}
-	if b.cmd != nil && b.cmd.Process != nil {
-		if runtime.GOOS == "windows" {
-			_ = exec.Command("taskkill", "/PID", strconv.Itoa(b.cmd.Process.Pid), "/T", "/F").Run()
-		} else {
-			_ = b.cmd.Process.Kill()
-		}
-		done := make(chan struct{})
-		go func() { _ = b.cmd.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-		}
-	}
-	if b.profileDir != "" && strings.HasPrefix(filepath.Base(b.profileDir), "shadoware-profile-") {
-		_ = os.RemoveAll(b.profileDir)
-	}
-}
-
-func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string, emit func(StreamEvent)) (string, []string, []string, []m3u8Capture, error) {
+func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extensionCaptureHub, jobHub *extensionJobHub, emit func(StreamEvent)) (string, []string, []string, []m3u8Capture, error) {
 	var (
 		m3u8URLs []string
 		allURLs  []string
@@ -678,17 +627,11 @@ func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extension
 		IsHLSScrape:  req.IsHLSScrape,
 	})
 
-	browser, err := launchExtensionBrowser(browserPath, extensionDir, jobID, req.UserAgent)
-	if err != nil {
-		jobHub.cancel(jobID)
-		return "", nil, nil, nil, err
-	}
-	defer closeExtensionBrowser(browser)
-
 	var result extensionJobResult
 	select {
 	case result = <-resultCh:
 	case <-ctx.Done():
+		jobHub.cancel(jobID)
 		return "", dedupe(m3u8URLs), dedupe(allURLs), nil, ctx.Err()
 	}
 

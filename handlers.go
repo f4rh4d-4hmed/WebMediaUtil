@@ -5,169 +5,35 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
-
-	"golang.org/x/sync/semaphore"
 )
 
-func handleTabList(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, pool.List())
+type Semaphore chan struct{}
+
+func NewSemaphore(n int) Semaphore {
+	return make(Semaphore, n)
+}
+
+func (s Semaphore) Acquire() {
+	s <- struct{}{}
+}
+
+func (s Semaphore) Release() {
+	<-s
+}
+
+func (s Semaphore) TryAcquire() bool {
+	select {
+	case s <- struct{}{}:
+		return true
+	default:
+		return false
 	}
 }
 
-func handleTabCreate(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			URL string `json:"url"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
-			writeError(w, "url is required", http.StatusBadRequest)
-			return
-		}
-		tab, err := pool.Open(req.URL)
-		if err != nil {
-			writeError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		writeJSON(w, http.StatusCreated, tab.info())
-	}
-}
-
-func handleTabGet(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		t, ok := pool.Get(r.PathValue("id"))
-		if !ok {
-			writeError(w, "tab not found", http.StatusNotFound)
-			return
-		}
-		writeJSON(w, http.StatusOK, t.info())
-	}
-}
-
-func handleTabClose(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !pool.Close(r.PathValue("id")) {
-			writeError(w, "tab not found", http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}
-}
-
-func handleTabNavigate(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			URL string `json:"url"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
-			writeError(w, "url is required", http.StatusBadRequest)
-			return
-		}
-		if err := pool.Navigate(r.PathValue("id"), req.URL); err != nil {
-			writeError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		t, _ := pool.Get(r.PathValue("id"))
-		writeJSON(w, http.StatusOK, t.info())
-	}
-}
-
-func handleTabActions(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Actions []BrowserAction `json:"actions"`
-			WaitMs  int             `json:"wait_ms"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		html, err := pool.RunActions(r.PathValue("id"), req.Actions, req.WaitMs)
-		if err != nil {
-			writeError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"content": html})
-	}
-}
-
-func handleTabSnapshot(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		html, m3u8s, urls, caps, err := pool.Snapshot(r.PathValue("id"))
-		if err != nil {
-			writeError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		resp := TaskResponse{
-			Content:  html,
-			M3u8URLs: m3u8s,
-			AllURLs:  urls,
-		}
-		if len(caps) > 0 {
-			resp.M3u8Headers = captureSliceToHeaders(caps)
-		}
-		writeJSON(w, http.StatusOK, resp)
-	}
-}
-
-func handleTabEvaluate(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Script string `json:"script"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Script) == "" {
-			writeError(w, "script is required", http.StatusBadRequest)
-			return
-		}
-		result, err := pool.Evaluate(r.PathValue("id"), req.Script)
-		if err != nil {
-			writeError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"result": result})
-	}
-}
-
-func handleTabClearURLs(pool *TabPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !pool.ClearURLs(r.PathValue("id")) {
-			writeError(w, "tab not found", http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}
-}
-
-func handleBrowserStatus(bm *BrowserManager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, bm.Status())
-	}
-}
-
-func handleBrowserRestart(bm *BrowserManager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		bm.Restart()
-		writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
-	}
-}
-
-func handleConfigGet(cfg Config, browserPath, browserName string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"port":         cfg.Port,
-			"headless":     cfg.Headless,
-			"max_tabs":     cfg.MaxTabs,
-			"timeout":      cfg.Timeout.String(),
-			"mode":         cfg.Mode,
-			"browser_name": browserName,
-			"browser_path": browserPath,
-		})
-	}
-}
-
-func handleExecute(bm *BrowserManager, sem *semaphore.Weighted, cfg Config, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string) http.HandlerFunc {
+func handleExecute(bd *BrowserDaemon, sem Semaphore, cfg Config, captureHub *extensionCaptureHub, jobHub *extensionJobHub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -182,37 +48,22 @@ func handleExecute(bm *BrowserManager, sem *semaphore.Weighted, cfg Config, capt
 			writeError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		mode := strings.ToLower(req.Mode)
-		if mode == "" {
-			mode = cfg.Mode
-		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), cfg.Timeout)
 		defer cancel()
 
-		if !sem.TryAcquire(1) {
+		if !sem.TryAcquire() {
 			writeError(w, "Server busy, try again shortly", http.StatusServiceUnavailable)
 			return
 		}
-		defer sem.Release(1)
+		defer sem.Release()
 
 		if req.Stream {
-			handleExecuteStream(w, r, ctx, bm.AllocCtx(), req, mode, captureHub, jobHub, browserPath, extensionDir)
+			handleExecuteStream(w, r, ctx, req, captureHub, jobHub)
 			return
 		}
 
-		var (
-			content  string
-			m3u8s    []string
-			allURLs  []string
-			captures []m3u8Capture
-			err      error
-		)
-		if mode == "cdp" {
-			content, m3u8s, allURLs, captures, err = scrapeCDP(ctx, bm.AllocCtx(), req, captureHub, nil)
-		} else {
-			content, m3u8s, allURLs, captures, err = scrapeExtension(ctx, req, captureHub, jobHub, browserPath, extensionDir, nil)
-		}
+		content, m3u8s, allURLs, captures, err := scrapeExtension(ctx, req, captureHub, jobHub, nil)
 
 		resp := TaskResponse{Content: content, M3u8URLs: m3u8s}
 		if req.Debug {
@@ -232,7 +83,7 @@ func handleExecute(bm *BrowserManager, sem *semaphore.Weighted, cfg Config, capt
 	}
 }
 
-func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Context, allocCtx context.Context, req TaskRequest, mode string, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string) {
+func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Context, req TaskRequest, captureHub *extensionCaptureHub, jobHub *extensionJobHub) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, "streaming not supported", http.StatusInternalServerError)
@@ -254,11 +105,7 @@ func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Con
 
 	go func() {
 		var res scrapeResult
-		if mode == "cdp" {
-			res.content, res.m3u8s, res.allURLs, res.captures, res.err = scrapeCDP(ctx, allocCtx, req, captureHub, emit)
-		} else {
-			res.content, res.m3u8s, res.allURLs, res.captures, res.err = scrapeExtension(ctx, req, captureHub, jobHub, browserPath, extensionDir, emit)
-		}
+		res.content, res.m3u8s, res.allURLs, res.captures, res.err = scrapeExtension(ctx, req, captureHub, jobHub, emit)
 		results <- res
 	}()
 
@@ -308,23 +155,105 @@ func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	}
 }
 
-func captureSliceToHeaders(caps []m3u8Capture) []CapturedURLHeader {
-	deduped := make(map[string]m3u8Capture)
-	for _, c := range caps {
-		if _, already := deduped[c.URL]; !already {
-			deduped[c.URL] = c
+func handleScrapeHLS(bd *BrowserDaemon, sem Semaphore, cfg Config, captureHub *extensionCaptureHub, jobHub *extensionJobHub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeHLSScrapeError(w, "Only POST allowed", http.StatusMethodNotAllowed)
+			return
 		}
+		var req HLSScrapeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHLSScrapeError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.URL == "" {
+			writeHLSScrapeError(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		parsed, err := url.ParseRequestURI(req.URL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			writeHLSScrapeError(w, "url must be a valid http/https URL", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.Timeout)
+		defer cancel()
+
+		if !sem.TryAcquire() {
+			writeHLSScrapeError(w, "Server busy, try again shortly", http.StatusServiceUnavailable)
+			return
+		}
+		defer sem.Release()
+
+		// Always scrape as an Android Chrome client for optimal video player interactions
+		androidChromeUA := "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
+		taskReq := TaskRequest{
+			URL:            req.URL,
+			WaitMs:         req.WaitMs,
+			LocalStorage:   req.LocalStorage,
+			Headers:        req.Headers,
+			IncludeHeaders: true,
+			UserAgent:      androidChromeUA,
+			IsHLSScrape:    true,
+		}
+
+		_, m3u8s, _, captures, err := scrapeExtension(ctx, taskReq, captureHub, jobHub, nil)
+		if err != nil {
+			writeHLSScrapeError(w, "Scraping failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if len(m3u8s) == 0 {
+			writeHLSScrapeError(w, "No HLS streams found", http.StatusNotFound)
+			return
+		}
+
+		log.Printf("[HLSScraper] Found %d candidate HLS URLs: %v", len(m3u8s), m3u8s)
+
+		var playableURL string
+		var finalQualities []HLSQuality
+		var finalHeaders map[string]string
+
+		for _, candidate := range m3u8s {
+			var reqHeaders map[string]string
+			for _, capEntry := range captures {
+				if capEntry.URL == candidate {
+					reqHeaders = capEntry.RequestHeaders
+					break
+				}
+			}
+			if reqHeaders == nil {
+				reqHeaders = make(map[string]string)
+			}
+			if _, ok := reqHeaders["User-Agent"]; !ok {
+				reqHeaders["User-Agent"] = androidChromeUA
+			}
+
+			log.Printf("[HLSScraper] Validating candidate HLS manifest: %s", candidate)
+			qualities, playErr := validateAndParseHLS(ctx, candidate, reqHeaders)
+			if playErr == nil {
+				log.Printf("[HLSScraper] Candidate is valid! Found %d stream qualities.", len(qualities))
+				playableURL = candidate
+				finalQualities = qualities
+				finalHeaders = reqHeaders
+				break
+			}
+			log.Printf("[HLSScraper] Candidate validation failed: %v", playErr)
+		}
+
+		if playableURL == "" {
+			writeHLSScrapeError(w, "Found HLS links but none were playable", http.StatusNotFound)
+			return
+		}
+
+		resp := HLSScrapeResponse{
+			PlayableURL: playableURL,
+			Qualities:   finalQualities,
+			Headers:     finalHeaders,
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}
-	out := make([]CapturedURLHeader, 0, len(deduped))
-	for _, c := range deduped {
-		out = append(out, CapturedURLHeader{
-			URL:             c.URL,
-			Status:          c.Status,
-			RequestHeaders:  c.RequestHeaders,
-			ResponseHeaders: c.ResponseHeaders,
-		})
-	}
-	return out
 }
 
 func handleExtensionCapture(hub *extensionCaptureHub) http.HandlerFunc {
@@ -338,7 +267,6 @@ func handleExtensionCapture(hub *extensionCaptureHub) http.HandlerFunc {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		log.Printf("[ExtensionCapture] Job: %s, URL: %s", ev.JobID, ev.URL)
 		hub.capture(ev)
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -370,7 +298,6 @@ func handleExtensionResult(hub *extensionJobHub) http.HandlerFunc {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		log.Printf("[ExtensionResult] Job: %s, M3u8s: %v, AllURLs: %v, Error: %s", result.JobID, result.M3u8URLs, result.AllURLs, result.Error)
 		if !hub.complete(result) {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -380,23 +307,71 @@ func handleExtensionResult(hub *extensionJobHub) http.HandlerFunc {
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+	})
+}
+
+func handleVersion(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(Version))
+}
+
+func handleConfigGet(cfg Config, bd *BrowserDaemon) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		status := bd.Status()
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"port":         cfg.Port,
+			"headless":     cfg.Headless,
+			"max_tabs":     cfg.MaxTabs,
+			"timeout":      cfg.Timeout.String(),
+			"browser":      status["browser"],
+			"browser_path": status["path"],
+			"status":       status["status"],
+			"pid":          status["pid"],
+			"uptime":       status["uptime"],
+		})
+	}
+}
+
+func captureSliceToHeaders(caps []m3u8Capture) []CapturedURLHeader {
+	deduped := make(map[string]m3u8Capture)
+	for _, c := range caps {
+		if _, already := deduped[c.URL]; !already {
+			deduped[c.URL] = c
+		}
+	}
+	out := make([]CapturedURLHeader, 0, len(deduped))
+	for _, c := range deduped {
+		out = append(out, CapturedURLHeader{
+			URL:             c.URL,
+			Status:          c.Status,
+			RequestHeaders:  c.RequestHeaders,
+			ResponseHeaders: c.ResponseHeaders,
+		})
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, msg string, code int) {
 	writeJSON(w, code, TaskResponse{Error: msg})
 }
 
+func writeHLSScrapeError(w http.ResponseWriter, msg string, code int) {
+	writeJSON(w, code, HLSScrapeResponse{Error: msg})
+}
+
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

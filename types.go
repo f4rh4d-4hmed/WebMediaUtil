@@ -16,13 +16,11 @@ type Config struct {
 	MaxTabs         int
 	Browser         string
 	Timeout         time.Duration
-	Mode            string
 	DisableWatchdog bool
 }
 
 type TaskRequest struct {
 	URL            string            `json:"url"`
-	Mode           string            `json:"mode,omitempty"`
 	WaitMs         int               `json:"wait_ms"`
 	LocalStorage   map[string]string `json:"local_storage,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
@@ -58,8 +56,8 @@ type CapturedURLHeader struct {
 	URL             string            `json:"url"`
 	Method          string            `json:"method,omitempty"`
 	Status          int               `json:"status,omitempty"`
-	RequestHeaders  map[string]string `json:"request_headers,omitempty"`  // headers sent by the browser
-	ResponseHeaders map[string]string `json:"response_headers,omitempty"` // headers returned by the server
+	RequestHeaders  map[string]string `json:"request_headers,omitempty"`
+	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
 	Error           string            `json:"error,omitempty"`
 }
 
@@ -76,6 +74,26 @@ type m3u8Capture struct {
 	RequestHeaders  map[string]string `json:"request_headers,omitempty"`
 	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
 	Status          int               `json:"status,omitempty"`
+}
+
+type HLSScrapeRequest struct {
+	URL          string            `json:"url"`
+	WaitMs       int               `json:"wait_ms"`
+	LocalStorage map[string]string `json:"local_storage,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+}
+
+type HLSQuality struct {
+	Quality string            `json:"quality"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+type HLSScrapeResponse struct {
+	PlayableURL string            `json:"playable_url"`
+	Qualities   []HLSQuality      `json:"qualities,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Error       string            `json:"error,omitempty"`
 }
 
 type scrapeResult struct {

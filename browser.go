@@ -2,410 +2,205 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"runtime"
-	"sort"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
-
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/cdproto/target"
-	"github.com/chromedp/chromedp"
 )
 
-const stealthScript = `
-(function () {
-	Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-	window.chrome = { runtime: {} };
-	Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-	Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-	const origQuery = window.navigator.permissions.query;
-	window.navigator.permissions.query = p =>
-		p.name === 'notifications'
-			? Promise.resolve({ state: Notification.permission })
-			: origQuery(p);
-	})();
-`
-
-type Tab struct {
-	ID        string    `json:"id"`
-	URL       string    `json:"url"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	ErrMsg    string    `json:"error,omitempty"`
-
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	m3u8s    []string
-	captures []m3u8Capture
-	urls     []string
+type BrowserDaemon struct {
+	mu           sync.RWMutex
+	browserPath  string
+	browserName  string
+	extensionDir string
+	process      *exec.Cmd
+	profileDir   string
+	startedAt    time.Time
+	ctx          context.Context
+	cancel       context.CancelFunc
+	running      bool
 }
 
-func (t *Tab) info() map[string]interface{} {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return map[string]interface{}{
-		"id":         t.ID,
-		"url":        t.URL,
-		"status":     t.Status,
-		"created_at": t.CreatedAt,
-		"error":      t.ErrMsg,
-		"url_count":  len(t.urls),
-		"m3u8_count": len(t.m3u8s),
+func NewBrowserDaemon(browserPath, browserName, extensionDir string) *BrowserDaemon {
+	return &BrowserDaemon{
+		browserPath:  browserPath,
+		browserName:  browserName,
+		extensionDir: extensionDir,
 	}
 }
 
-type TabPool struct {
-	mu   sync.RWMutex
-	tabs map[string]*Tab
-	bm   *BrowserManager
-}
-
-func newTabPool(bm *BrowserManager) *TabPool {
-	return &TabPool{tabs: make(map[string]*Tab), bm: bm}
-}
-
-func (p *TabPool) Open(reqURL string) (*Tab, error) {
-	allocCtx := p.bm.AllocCtx()
-	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
-
-	tab := &Tab{
-		ID:        newID(),
-		URL:       reqURL,
-		Status:    "loading",
-		CreatedAt: time.Now(),
-		ctx:       tabCtx,
-		cancel:    tabCancel,
+func (bd *BrowserDaemon) Start() {
+	bd.mu.Lock()
+	if bd.running {
+		bd.mu.Unlock()
+		return
 	}
+	bd.running = true
+	bd.startedAt = time.Now()
+	bd.ctx, bd.cancel = context.WithCancel(context.Background())
+	bd.mu.Unlock()
 
-	scanner := newResponseBodyScanner()
+	go bd.monitorLoop()
+}
 
-	trackURL := func(u string) {
-		u = normalizeCapturedURL(u, reqURL)
-		if u == "" {
+func (bd *BrowserDaemon) monitorLoop() {
+	for {
+		bd.mu.RLock()
+		if !bd.running {
+			bd.mu.RUnlock()
 			return
 		}
-		tab.mu.Lock()
-		tab.urls = append(tab.urls, u)
-		if isMediaCandidateURL(u) {
-			tab.m3u8s = append(tab.m3u8s, u)
-		}
-		tab.mu.Unlock()
-	}
-	trackCapture := func(c m3u8Capture) {
-		tab.mu.Lock()
-		tab.captures = append(tab.captures, c)
-		tab.mu.Unlock()
-	}
-	trackText := func(text, base string) {
-		for _, u := range extractCandidateURLs(text, base) {
-			trackURL(u)
-		}
-	}
+		bd.mu.RUnlock()
 
-	mainHandler := scanner.listen(tabCtx, trackURL, trackText, trackCapture)
-	var attachChild func(context.Context, target.ID)
-	attachChild = func(parent context.Context, tid target.ID) {
-		cctx, _ := chromedp.NewContext(parent, chromedp.WithTargetID(tid))
-		ch := scanner.listen(cctx, trackURL, trackText, trackCapture)
-		chromedp.ListenTarget(cctx, func(ev interface{}) {
-			ch(ev)
-			if e, ok := ev.(*target.EventAttachedToTarget); ok {
-				go attachChild(cctx, e.TargetInfo.TargetID)
-			}
-		})
-		go chromedp.Run(cctx,
-			target.SetAutoAttach(true, false).WithFlatten(true),
-			network.Enable().WithMaxTotalBufferSize(100*1024*1024).WithMaxResourceBufferSize(maxResponseBodyScanBytes),
-		)
-	}
-	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		mainHandler(ev)
-		if e, ok := ev.(*target.EventAttachedToTarget); ok {
-			t := string(e.TargetInfo.Type)
-			if t == "iframe" || t == "page" || t == "service_worker" || t == "worker" {
-				go attachChild(tabCtx, e.TargetInfo.TargetID)
-			}
-		}
-	})
-
-	p.mu.Lock()
-	p.tabs[tab.ID] = tab
-	p.mu.Unlock()
-
-	go func() {
-		err := chromedp.Run(tabCtx,
-			target.SetAutoAttach(true, false).WithFlatten(true),
-			network.Enable().WithMaxTotalBufferSize(100*1024*1024),
-			chromedp.ActionFunc(func(ctx context.Context) error {
-				_, err := page.AddScriptToEvaluateOnNewDocument(stealthScript).Do(ctx)
-				return err
-			}),
-			chromedp.Navigate(reqURL),
-			chromedp.WaitReady("body", chromedp.ByQuery),
-		)
-		tab.mu.Lock()
+		profileDir, err := os.MkdirTemp("", "webmediautil-profile-")
 		if err != nil {
-			tab.Status = "error"
-			tab.ErrMsg = err.Error()
+			log.Printf("BrowserDaemon: Failed to create temp profile dir: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		bd.mu.Lock()
+		bd.profileDir = profileDir
+		args := buildBrowserArgs(bd.extensionDir, profileDir)
+		cmd := exec.Command(bd.browserPath, args...)
+		bd.process = cmd
+		bd.mu.Unlock()
+
+		log.Printf("BrowserDaemon: Launching %s (%s)...", bd.browserName, bd.browserPath)
+		if err := cmd.Start(); err != nil {
+			log.Printf("BrowserDaemon: Failed to start browser process: %v", err)
+			_ = os.RemoveAll(profileDir)
+			bd.mu.Lock()
+			bd.profileDir = ""
+			bd.process = nil
+			bd.mu.Unlock()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Wait for the browser to exit (e.g. crash or stopped)
+		err = cmd.Wait()
+
+		bd.mu.Lock()
+		log.Printf("BrowserDaemon: Browser process exited (pid=%d, err=%v)", cmd.Process.Pid, err)
+		if bd.profileDir != "" {
+			_ = os.RemoveAll(bd.profileDir)
+			bd.profileDir = ""
+		}
+		bd.process = nil
+		running := bd.running
+		bd.mu.Unlock()
+
+		if !running {
+			return
+		}
+
+		log.Println("BrowserDaemon: Restarting browser process in 1 second...")
+		select {
+		case <-bd.ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+	}
+}
+
+func (bd *BrowserDaemon) Stop() {
+	bd.mu.Lock()
+	if !bd.running {
+		bd.mu.Unlock()
+		return
+	}
+	bd.running = false
+	if bd.cancel != nil {
+		bd.cancel()
+	}
+	cmd := bd.process
+	profileDir := bd.profileDir
+	bd.process = nil
+	bd.profileDir = ""
+	bd.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		log.Printf("BrowserDaemon: Terminating browser process (pid=%d)...", cmd.Process.Pid)
+		if runtime.GOOS == "windows" {
+			_ = exec.Command("taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T", "/F").Run()
 		} else {
-			tab.Status = "ready"
+			_ = cmd.Process.Kill()
 		}
-		tab.mu.Unlock()
-	}()
-
-	return tab, nil
-}
-
-func (p *TabPool) Get(id string) (*Tab, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	t, ok := p.tabs[id]
-	return t, ok
-}
-
-func (p *TabPool) Close(id string) bool {
-	p.mu.Lock()
-	t, ok := p.tabs[id]
-	if ok {
-		delete(p.tabs, id)
+		done := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			log.Println("BrowserDaemon: Timeout waiting for browser shutdown.")
+		}
 	}
-	p.mu.Unlock()
-	if ok {
-		t.cancel()
-	}
-	return ok
-}
 
-func (p *TabPool) CloseAll() {
-	p.mu.Lock()
-	tabs := make([]*Tab, 0, len(p.tabs))
-	for _, t := range p.tabs {
-		tabs = append(tabs, t)
-	}
-	p.tabs = make(map[string]*Tab)
-	p.mu.Unlock()
-	for _, t := range tabs {
-		t.cancel()
+	if profileDir != "" {
+		_ = os.RemoveAll(profileDir)
 	}
 }
 
-func (p *TabPool) List() []map[string]interface{} {
-	p.mu.RLock()
-	tabs := make([]*Tab, 0, len(p.tabs))
-	for _, t := range p.tabs {
-		tabs = append(tabs, t)
-	}
-	p.mu.RUnlock()
-	sort.Slice(tabs, func(i, j int) bool {
-		return tabs[i].CreatedAt.Before(tabs[j].CreatedAt)
-	})
-	out := make([]map[string]interface{}, len(tabs))
-	for i, t := range tabs {
-		out[i] = t.info()
-	}
-	return out
-}
+func (bd *BrowserDaemon) Status() map[string]interface{} {
+	bd.mu.RLock()
+	defer bd.mu.RUnlock()
 
-func (p *TabPool) Navigate(id, newURL string) error {
-	t, ok := p.Get(id)
-	if !ok {
-		return errors.New("tab not found")
+	status := "stopped"
+	pid := 0
+	if bd.running {
+		status = "running"
+		if bd.process != nil && bd.process.Process != nil {
+			pid = bd.process.Process.Pid
+		}
 	}
-	t.mu.Lock()
-	t.Status = "loading"
-	t.URL = newURL
-	t.mu.Unlock()
 
-	err := chromedp.Run(t.ctx,
-		chromedp.Navigate(newURL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-	)
-	t.mu.Lock()
-	if err != nil {
-		t.Status = "error"
-		t.ErrMsg = err.Error()
-	} else {
-		t.Status = "ready"
-		t.ErrMsg = ""
-	}
-	t.mu.Unlock()
-	return err
-}
-
-func (p *TabPool) RunActions(id string, actions []BrowserAction, waitMs int) (string, error) {
-	t, ok := p.Get(id)
-	if !ok {
-		return "", errors.New("tab not found")
-	}
-	cdpActions := make([]chromedp.Action, 0, len(actions)+2)
-	for _, a := range actions {
-		cdpActions = append(cdpActions, buildBrowserAction(a))
-	}
-	if waitMs > 0 {
-		cdpActions = append(cdpActions, chromedp.Sleep(time.Duration(waitMs)*time.Millisecond))
-	}
-	var html string
-	cdpActions = append(cdpActions, chromedp.OuterHTML("html", &html))
-	return html, chromedp.Run(t.ctx, cdpActions...)
-}
-
-func (p *TabPool) Snapshot(id string) (string, []string, []string, []m3u8Capture, error) {
-	t, ok := p.Get(id)
-	if !ok {
-		return "", nil, nil, nil, errors.New("tab not found")
-	}
-	var html string
-	if err := chromedp.Run(t.ctx, chromedp.OuterHTML("html", &html)); err != nil {
-		return "", nil, nil, nil, err
-	}
-	t.mu.Lock()
-	m3u8s := dedupe(append([]string(nil), t.m3u8s...))
-	urls := dedupe(append([]string(nil), t.urls...))
-	caps := append([]m3u8Capture(nil), t.captures...)
-	t.mu.Unlock()
-	return html, m3u8s, urls, caps, nil
-}
-
-func (p *TabPool) Evaluate(id, script string) (interface{}, error) {
-	t, ok := p.Get(id)
-	if !ok {
-		return nil, errors.New("tab not found")
-	}
-	var result interface{}
-	err := chromedp.Run(t.ctx, chromedp.Evaluate(script, &result))
-	return result, err
-}
-
-func (p *TabPool) ClearURLs(id string) bool {
-	t, ok := p.Get(id)
-	if !ok {
-		return false
-	}
-	t.mu.Lock()
-	t.m3u8s = nil
-	t.urls = nil
-	t.captures = nil
-	t.mu.Unlock()
-	return true
-}
-
-type BrowserManager struct {
-	mu          sync.RWMutex
-	allocCtx    context.Context
-	allocCancel context.CancelFunc
-	opts        []chromedp.ExecAllocatorOption
-	pool        *TabPool
-	browserPath string
-	browserName string
-	startedAt   time.Time
-}
-
-func newBrowserManager(browserPath, browserName string, opts []chromedp.ExecAllocatorOption) *BrowserManager {
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	return &BrowserManager{
-		allocCtx:    allocCtx,
-		allocCancel: allocCancel,
-		opts:        opts,
-		browserPath: browserPath,
-		browserName: browserName,
-		startedAt:   time.Now(),
-	}
-}
-
-func (bm *BrowserManager) AllocCtx() context.Context {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	return bm.allocCtx
-}
-
-func (bm *BrowserManager) Restart() {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-	if bm.pool != nil {
-		bm.pool.CloseAll()
-	}
-	bm.allocCancel()
-	bm.allocCtx, bm.allocCancel = chromedp.NewExecAllocator(context.Background(), bm.opts...)
-	bm.startedAt = time.Now()
-	log.Println("Browser restarted")
-}
-
-func (bm *BrowserManager) Status() map[string]interface{} {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
 	return map[string]interface{}{
-		"browser":    bm.browserName,
-		"path":       bm.browserPath,
-		"started_at": bm.startedAt,
-		"uptime":     time.Since(bm.startedAt).String(),
+		"browser":    bd.browserName,
+		"path":       bd.browserPath,
+		"status":     status,
+		"pid":        pid,
+		"started_at": bd.startedAt.Format(time.RFC3339),
+		"uptime":     time.Since(bd.startedAt).String(),
 	}
 }
 
-func buildAllocatorOptions(browserPath, extensionDir string, cfg Config) []chromedp.ExecAllocatorOption {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.ExecPath(browserPath),
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.DisableGPU,
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-extensions", false),
-		chromedp.Flag("disable-extensions-except", extensionDir),
-		chromedp.Flag("load-extension", extensionDir),
-		chromedp.Flag("disable-plugins", true),
-		chromedp.Flag("disable-sync", true),
-		chromedp.Flag("disable-translate", true),
-		chromedp.Flag("disable-default-apps", true),
-		chromedp.Flag("mute-audio", true),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.Flag("metrics-recording-only", true),
-		chromedp.Flag("safebrowsing-disable-auto-update", true),
-		chromedp.Flag("js-flags", "--max-old-space-size=128"),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("enable-features", "MediaSourceAPI,MSE,BackForwardCache"),
-		chromedp.Flag("autoplay-policy", "no-user-gesture-required"),
-	)
-	if cfg.Headless {
-		opts = append(opts, chromedp.Flag("headless", true))
-	} else {
-		opts = append(opts, chromedp.Flag("headless", false))
-	}
-	return opts
-}
-
-func buildBrowserAction(a BrowserAction) chromedp.Action {
-	switch strings.ToLower(a.Type) {
-	case "wait", "sleep":
-		return chromedp.Sleep(time.Duration(a.WaitMs) * time.Millisecond)
-	case "click":
-		if a.Selector != "" {
-			return chromedp.Click(a.Selector, chromedp.ByQuery)
-		}
-		return chromedp.MouseClickXY(a.X, a.Y)
-	case "double_click":
-		if a.Selector != "" {
-			return chromedp.DoubleClick(a.Selector, chromedp.ByQuery)
-		}
-		return chromedp.MouseClickXY(a.X, a.Y, chromedp.ClickCount(2))
-	case "evaluate", "eval":
-		return chromedp.Evaluate(a.Script, nil)
-	case "scroll":
-		return chromedp.Evaluate(fmt.Sprintf("window.scrollBy(%f,%f)", a.DeltaX, a.DeltaY), nil)
-	case "send_keys", "type":
-		return chromedp.SendKeys(a.Selector, a.Text, chromedp.ByQuery)
-	case "wait_ready":
-		return chromedp.WaitReady(a.Selector, chromedp.ByQuery)
-	default:
-		return chromedp.ActionFunc(func(context.Context) error {
-			return fmt.Errorf("unsupported action type %q", a.Type)
-		})
+func buildBrowserArgs(extensionDir, profileDir string) []string {
+	return []string{
+		"--user-data-dir=" + profileDir,
+		"--headless=new",
+		"--no-sandbox",
+		"--disable-gpu",
+		"--disable-dev-shm-usage",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-blink-features=AutomationControlled",
+		"--disable-extensions-except=" + extensionDir,
+		"--load-extension=" + extensionDir,
+		"--window-size=1365,768",
+		"--mute-audio",
+		"--autoplay-policy=no-user-gesture-required",
+		"--enable-features=MediaSourceAPI,MSE,BackForwardCache",
+		"--disable-background-networking",
+		"--disable-background-timer-throttling",
+		"--disable-backgrounding-occluded-windows",
+		"--disable-breakpad",
+		"--disable-client-side-phishing-detection",
+		"--disable-default-apps",
+		"--disable-hang-monitor",
+		"--disable-ipc-flooding-protection",
+		"--disable-prompt-on-repost",
+		"--disable-renderer-backgrounding",
+		"--disable-sync",
+		"--metrics-recording-only",
+		"--safebrowsing-disable-auto-update",
+		"--password-store=basic",
+		"--use-mock-keychain",
+		"--js-flags=--max-old-space-size=256",
+		"--disable-logging",
+		"about:blank",
 	}
 }
 

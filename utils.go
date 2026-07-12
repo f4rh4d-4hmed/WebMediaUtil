@@ -6,18 +6,25 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 var mediaURLPattern = regexp.MustCompile(`(?i)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\.m3u8|m3u8|\.mpd|/playlist|/master|manifest)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*`)
+
+var (
+	bandwidthRegex  = regexp.MustCompile(`BANDWIDTH=(\d+)`)
+	resolutionRegex = regexp.MustCompile(`RESOLUTION=(\d+x\d+)`)
+)
 
 func collectM3U8Headers(ctx context.Context, mediaURLs []string) []CapturedURLHeader {
 	unique := dedupe(mediaURLs)
@@ -179,6 +186,11 @@ func dedupe(in []string) []string {
 
 func startParentWatchdog(shutdown func(string)) {
 	ppid := os.Getppid()
+	// Disable watchdog if started without a specific parent or if adopting init process
+	if ppid <= 4 {
+		log.Printf("Watchdog disabled: parent PID %d is system/init process", ppid)
+		return
+	}
 	log.Printf("Watchdog: monitoring parent PID %d", ppid)
 	go func() {
 		t := time.NewTicker(2 * time.Second)
@@ -265,134 +277,80 @@ func safeFilePart(s string) string {
 	return b.String()
 }
 
-const hlsScraperInjectedScript = `(function() {
-  // 1. Popup Blocker
-  try {
-    if (window.open) {
-      window.open = function() {
-        console.log("Blocked window.open call");
-        return null;
-      };
-    }
-  } catch (e) {}
+func validateAndParseHLS(ctx context.Context, manifestURL string, headers map[string]string) ([]HLSQuality, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		if strings.EqualFold(k, "accept-encoding") {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
 
-  document.addEventListener('click', function(e) {
-    let target = e.target;
-    while (target && target.tagName !== 'A') {
-      target = target.parentNode;
-    }
-    if (target && target.getAttribute('target') === '_blank') {
-      console.log("Blocked target=_blank link click");
-      e.preventDefault();
-    }
-  }, true);
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status code: %d", resp.StatusCode)
+	}
 
-  // 2. Cloudflare Turnstile Bypass
-  const checkTurnstile = () => {
-    const stage = document.getElementById('challenge-stage') || 
-                  document.querySelector('.ctp-checkbox-label') || 
-                  document.querySelector('input[type="checkbox"]') ||
-                  document.querySelector('.mark');
-    if (stage) {
-      const cb = stage.querySelector('input') || stage.querySelector('.mark') || stage;
-      if (cb) {
-        console.log("Turnstile checkbox detected. Click triggered.");
-        cb.click();
-        const rect = cb.getBoundingClientRect();
-        const x = rect.left + rect.width / 2;
-        const y = rect.top + rect.height / 2;
-        const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-        cb.dispatchEvent(new MouseEvent('mousedown', opts));
-        cb.dispatchEvent(new MouseEvent('mouseup', opts));
-        cb.dispatchEvent(new MouseEvent('click', opts));
-      }
-    }
-  };
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyScanBytes))
+	if err != nil {
+		return nil, err
+	}
 
-  // 3. Video Play Autoplay Clicker
-  const checkVideoPlay = () => {
-    const videos = document.querySelectorAll('video');
-    videos.forEach(v => {
-      if (v.paused) {
-        console.log("Found paused HTML5 video, playing...");
-        v.play().catch(e => {});
-        const rect = v.getBoundingClientRect();
-        const x = rect.left + rect.width / 2;
-        const y = rect.top + rect.height / 2;
-        const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-        v.dispatchEvent(new MouseEvent('mousedown', opts));
-        v.dispatchEvent(new MouseEvent('mouseup', opts));
-        v.dispatchEvent(new MouseEvent('click', opts));
-      }
-    });
+	bodyText := string(bodyBytes)
+	if !strings.HasPrefix(bodyText, "#EXTM3U") {
+		return nil, errors.New("invalid m3u8 playlist: missing #EXTM3U header")
+	}
 
-    const playSelectors = [
-      '.jw-display-icon-container',
-      '.vjs-big-play-button',
-      '.plyr__control--overlaid',
-      'button[aria-label="Play"]',
-      'button[class*="play"]',
-      'div[class*="play"]',
-      'span[class*="play"]',
-      '[id*="play"]',
-      '.video-player',
-      'div[class*="player"]',
-      'video-js'
-    ];
-    playSelectors.forEach(sel => {
-      const elements = document.querySelectorAll(sel);
-      elements.forEach(el => {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          console.log("Found play element:", sel, "- clicking.");
-          el.click();
-          const opts = { bubbles: true, cancelable: true, view: window };
-          el.dispatchEvent(new MouseEvent('mousedown', opts));
-          el.dispatchEvent(new MouseEvent('mouseup', opts));
-          el.dispatchEvent(new MouseEvent('click', opts));
-        }
-      });
-    });
+	var qualities []HLSQuality
+	lines := strings.Split(bodyText, "\n")
+	var currentInfo string
 
-    const iframes = document.querySelectorAll('iframe');
-    iframes.forEach(iframe => {
-      try {
-        const innerDoc = iframe.contentDocument || iframe.contentWindow.document;
-        if (innerDoc) {
-          const innerVideos = innerDoc.querySelectorAll('video');
-          innerVideos.forEach(v => {
-            if (v.paused) {
-              v.play().catch(()=>{});
-              v.click();
-            }
-          });
-        }
-      } catch (e) {
-        const rect = iframe.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          console.log("Found cross-origin iframe, clicking center.");
-          const x = rect.left + rect.width / 2;
-          const y = rect.top + rect.height / 2;
-          const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-          iframe.dispatchEvent(new MouseEvent('mousedown', opts));
-          iframe.dispatchEvent(new MouseEvent('mouseup', opts));
-          iframe.dispatchEvent(new MouseEvent('click', opts));
-        }
-      }
-    });
-  };
+	baseURL, err := url.Parse(manifestURL)
+	if err != nil {
+		baseURL = nil
+	}
 
-  let checksCount = 0;
-  const timer = setInterval(() => {
-    checkTurnstile();
-    checkVideoPlay();
-    checksCount++;
-    if (checksCount > 30) {
-      clearInterval(timer);
-    }
-  }, 1500);
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
+			currentInfo = line
+		} else if !strings.HasPrefix(line, "#") {
+			if currentInfo != "" {
+				resolution := "unknown"
+				if match := resolutionRegex.FindStringSubmatch(currentInfo); len(match) > 1 {
+					resolution = match[1]
+				} else if match := bandwidthRegex.FindStringSubmatch(currentInfo); len(match) > 1 {
+					bandwidth, _ := strconv.Atoi(match[1])
+					resolution = fmt.Sprintf("%d Kbps", bandwidth/1000)
+				}
 
-  checkTurnstile();
-  checkVideoPlay();
-})();`
+				streamURL := line
+				if baseURL != nil {
+					if parsedStream, err := url.Parse(streamURL); err == nil {
+						streamURL = baseURL.ResolveReference(parsedStream).String()
+					}
+				}
 
+				qualities = append(qualities, HLSQuality{
+					Quality: resolution,
+					URL:     streamURL,
+					Headers: headers,
+				})
+				currentInfo = ""
+			}
+		}
+	}
+
+	return qualities, nil
+}

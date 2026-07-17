@@ -25,21 +25,74 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Windows
           - label: windows-amd64
             runner: windows-latest
             goos: windows
             goarch: amd64
             target: windows-amd64
+          - label: windows-arm64
+            runner: windows-latest
+            goos: windows
+            goarch: arm64
+            target: windows-arm64
+          - label: windows-386
+            runner: windows-latest
+            goos: windows
+            goarch: "386"
+            target: windows-386
+
+          # Linux
           - label: linux-amd64
             runner: ubuntu-latest
             goos: linux
             goarch: amd64
             target: linux-amd64
+          - label: linux-arm64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            target: linux-arm64
+          - label: linux-386
+            runner: ubuntu-latest
+            goos: linux
+            goarch: "386"
+            target: linux-386
+          - label: linux-arm
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm
+            goarm: "7"
+            target: linux-armv7
+          - label: linux-riscv64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: riscv64
+            target: linux-riscv64
+
+          # macOS
+          - label: macos-amd64
+            runner: macos-latest
+            goos: darwin
+            goarch: amd64
+            target: macos-amd64
           - label: macos-arm64
             runner: macos-latest
             goos: darwin
             goarch: arm64
             target: macos-arm64
+
+          # FreeBSD
+          - label: freebsd-amd64
+            runner: ubuntu-latest
+            goos: freebsd
+            goarch: amd64
+            target: freebsd-amd64
+          - label: freebsd-arm64
+            runner: ubuntu-latest
+            goos: freebsd
+            goarch: arm64
+            target: freebsd-arm64
 
     steps:
       - uses: actions/checkout@v6
@@ -70,7 +123,7 @@ jobs:
             LDFLAGS="${LDFLAGS} -X main.Version=${VERSION}"
           fi
 
-          CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+          CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" GOARM="${{ matrix.goarm }}" \
             go build -trimpath -ldflags="${LDFLAGS}" -o "${out}" .
 
           echo "artifact_path=${out}" >> "${GITHUB_OUTPUT}"
@@ -102,3 +155,4 @@ jobs:
           name: ${{ env.APP_NAME }} ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
           files: release-assets/*
           generate_release_notes: true
+          
